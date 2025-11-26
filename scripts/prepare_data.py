@@ -42,40 +42,26 @@ def load_hh_rlhf_dataset(max_samples: int = 1000) -> Tuple[List[Dict], List[Dict
     
     # Load the dataset
     try:
-        # Load both helpful and harmless subsets
-        helpful_dataset = load_dataset("Anthropic/hh-rlhf", "helpful-base", split="train")
-        harmless_dataset = load_dataset("Anthropic/hh-rlhf", "harmless-base", split="train")
+        # Load the default configuration (combines helpful and harmless)
+        dataset = load_dataset("Anthropic/hh-rlhf", split="train")
         
-        print(f"Loaded {len(helpful_dataset)} helpful examples")
-        print(f"Loaded {len(harmless_dataset)} harmless examples")
+        print(f"Loaded {len(dataset)} examples")
         
     except Exception as e:
         print(f"Failed to load dataset: {e}")
         print("Falling back to sample data...")
         return create_fallback_data(max_samples)
     
-    # Combine and shuffle datasets
+    # Transform and shuffle datasets
     all_data = []
-    
-    # Process helpful examples
-    for i, example in enumerate(helpful_dataset):
+
+    for example in dataset:
         if len(all_data) >= max_samples:
             break
-            
+
         processed_example = process_hh_example(example)
         if processed_example:
             all_data.append(processed_example)
-    
-    # Add harmless examples if we need more
-    remaining_samples = max_samples - len(all_data)
-    if remaining_samples > 0:
-        for i, example in enumerate(harmless_dataset):
-            if len(all_data) >= max_samples:
-                break
-                
-            processed_example = process_hh_example(example)
-            if processed_example:
-                all_data.append(processed_example)
     
     # Shuffle the combined data
     random.shuffle(all_data)
