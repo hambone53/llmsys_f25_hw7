@@ -281,7 +281,7 @@ class RewardModelTrainer:
         # 1. Get rewards for chosen responses
         # 2. Get rewards for rejected responses
         # 3. Compute ranking loss: chosen should have higher reward than rejected
-
+        self.model.forward()
         raise NotImplementedError("Need to implement loss computation for Assignment 7")
         # END ASSIGN7_1
     
@@ -295,6 +295,7 @@ class RewardModelTrainer:
         Returns:
             Dictionary with training metrics
         """
+        # Put model in training and clear out grads for new training round.
         self.model.train()
         self.optimizer.zero_grad()
         
