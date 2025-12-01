@@ -438,7 +438,9 @@ class VERLTrainer:
         # 1. Compute returns = rewards + gamma * values (assume next state value = current value)
         # 2. Compute advantages = returns - values
         # 3. Normalize advantages: (advantages - mean) / (std + 1e-8)
-        raise NotImplementedError("Need to implement GAE computation for Assignment 7")
+        returns = rewards + self.ppo_config['gamma'] * values
+        advantages = returns - values
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
         # END ASSIGN7_2_1
         
@@ -531,7 +533,13 @@ class VERLTrainer:
             #    - surr2 = clipped_ratio * advantages (clip ratio between 1-eps and 1+eps)
             # 3. Policy loss = -min(surr1, surr2).mean()
             # 4. Compute entropy bonus from policy logits
-            raise NotImplementedError("Need to implement PPO loss computation for Assignment 7")
+            ratio = torch.exp(new_log_probs - rollout_batch.log_probs)
+            surr1 = ratio * rollout_batch.advantages
+            clip_eps = self.ppo_config['clip_eps']
+            surr2 = torch.clip(ratio, 1-clip_eps, 1+clip_eps) * rollout_batch.advantages
+            policy_loss = -torch.min(surr1, surr2).mean()
+            probs = torch.softmax(policy_outputs.logits, dim=-1)
+            entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=-1).mean()
             
             # END ASSIGN7_2_2
             
