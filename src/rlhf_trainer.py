@@ -227,7 +227,8 @@ class VERLValueWrapper(nn.Module):
         self.tokenizer = tokenizer
         
         # Create value head on top of the policy model
-        self.backbone = policy_model
+        from copy import deepcopy
+        self.backbone = deepcopy(policy_model) # Don't want to share parameters between policy and value model unless we train total loss together.
         
         self.value_head = nn.Linear(policy_model.config.hidden_size, 1)
         nn.init.normal_(self.value_head.weight, std=0.02)
@@ -487,9 +488,7 @@ class VERLTrainer:
             clip_eps = self.ppo_config['clip_eps']
             surr2 = torch.clip(ratio, 1-clip_eps, 1+clip_eps) * rollout_batch.advantages
             policy_loss = -torch.min(surr1, surr2).mean()
-            probs = torch.softmax(policy_outputs.logits, dim=-1)
-            entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=-1).mean()
-            
+            entropy = self._compute_entropy(policy_outputs.logits)
             # END ASSIGN7_2_2
             
             # Total policy loss with entropy bonus
@@ -593,7 +592,10 @@ class VERLTrainer:
         # 2. Convert logits to log_probabilities using log_softmax
         # 3. Compute entropy: -(probs * log_probs).sum(dim=-1)
         # 4. Return mean over sequence length
-        raise NotImplementedError("Need to implement entropy computation for Assignment 7")
+        probs = torch.softmax(logits, dim=-1)
+        log_probs = torch.log_softmax(logits, dim=-1)
+        entropy = -(probs * log_probs).sum(dim=-1).mean()
+        return entropy
         
         # END ASSIGN7_2_3
     
