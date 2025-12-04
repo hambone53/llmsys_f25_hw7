@@ -128,6 +128,9 @@ class VERLPolicyWrapper(nn.Module):
                 eos_token_id=self.tokenizer.eos_token_id,
                 return_dict_in_generate=True,
                 output_scores=True,
+                # FIX: Add for stability
+                min_p=0.001, # Minimum prob threshold
+                repetition_penalty=1.1, #prvent repeating
                 **kwargs
             )
         
@@ -227,8 +230,8 @@ class VERLValueWrapper(nn.Module):
         self.tokenizer = tokenizer
         
         # Create value head on top of the policy model
-        from copy import deepcopy
-        self.backbone = deepcopy(policy_model) # Don't want to share parameters between policy and value model unless we train total loss together.
+        from transformers import AutoModelForCausalLM
+        self.backbone = AutoModelForCausalLM.from_pretrained(policy_model.config._name_or_path) # Don't want to share parameters between policy and value model unless we train total loss together.
         
         self.value_head = nn.Linear(policy_model.config.hidden_size, 1)
         nn.init.normal_(self.value_head.weight, std=0.02)
@@ -674,6 +677,8 @@ def create_rlhf_trainer(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         policy_model.config.pad_token_id = tokenizer.pad_token_id
+
+    tokenizer.padding_side = 'left'
     
     # Create trainer
     trainer = VERLTrainer(
