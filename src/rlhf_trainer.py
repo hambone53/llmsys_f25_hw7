@@ -31,6 +31,8 @@ class RolloutBatch:
     values: torch.Tensor
     advantages: torch.Tensor
     returns: torch.Tensor
+    full_seq: torch.Tensor
+    prompt_len: int
 
 
 @dataclass
@@ -128,13 +130,12 @@ class VERLPolicyWrapper(nn.Module):
                 eos_token_id=self.tokenizer.eos_token_id,
                 return_dict_in_generate=True,
                 output_scores=True,
-                # # FIX: Add for stability
-                # min_p=0.001, # Minimum prob threshold
-                # repetition_penalty=1.1, #prvent repeating
                 **kwargs
             )
         
         # Extract generated sequences
+
+        # generated_ids[:,i + prompt_lengths] is the prediction using generated.scores[:,i]
         generated_ids = generated.sequences
         
         prompt_lengths = encoded_prompts['input_ids'].shape[1]
@@ -150,9 +151,9 @@ class VERLPolicyWrapper(nn.Module):
         log_probs = self._compute_log_probs(generated_ids, generated.scores, prompt_lengths)
         
         self.model.train()
-        return responses, log_probs
+        return responses, log_probs, generated_ids, prompt_lengths
     
-    def _compute_log_probs(
+    def _compute_log_probs_tensor(
         self, 
         generated_ids: torch.Tensor, 
         scores: Tuple[torch.Tensor],
@@ -168,14 +169,17 @@ class VERLPolicyWrapper(nn.Module):
         Returns:
             Log probabilities tensor
         """
-        if not scores:
-            # Fallback: compute log probs through forward pass
-            return self._compute_log_probs_fallback(generated_ids)
+        seq_len = generated_ids.shape[1]
+        gen_len = scores.shape[1]
+        assert seq_len == gen_len + prompt_lengths
+        assert self.tokenizer.pad_token_id == self.tokenizer.eos_token_id # this is specific to our setup
         
-        log_probs = torch.stack([
-            torch.log_softmax(score, dim=-1) 
-            for score in scores
-        ], dim=1)
+        # log_probs = torch.stack([
+        #     torch.log_softmax(score, dim=-1) 
+        #     for score in scores
+        # ], dim=1)
+
+        log_probs = torch.log_softmax(scores, dim=-1) # [batch_size, gen_len, vocab_size]
         
         # Extract log probs for generated tokens
         batch_size, seq_len = generated_ids.shape
@@ -185,11 +189,13 @@ class VERLPolicyWrapper(nn.Module):
             sequence_log_probs = []
             for j in range(prompt_lengths, seq_len):  # skip the prompt part
                 token_id = generated_ids[i, j]
-                if token_id == self.tokenizer.pad_token_id: # break if we see padding token
+                assert j - prompt_lengths < log_probs.shape[1]
+                # add the probability first: the first time we see EOS/PAD token id
+                # always indicates it's an EOS so we need to count this value
+                token_log_prob = log_probs[i, j-prompt_lengths, token_id]
+                sequence_log_probs.append(token_log_prob)
+                if token_id == self.tokenizer.eos_token_id:
                     break
-                if j-prompt_lengths < log_probs.shape[1]:
-                    token_log_prob = log_probs[i, j-prompt_lengths, token_id]
-                    sequence_log_probs.append(token_log_prob)
             
             if sequence_log_probs:
                 generated_log_probs.append(torch.stack(sequence_log_probs).sum())
@@ -198,23 +204,28 @@ class VERLPolicyWrapper(nn.Module):
         
         return torch.stack(generated_log_probs)
     
-    def _compute_log_probs_fallback(self, generated_ids: torch.Tensor) -> torch.Tensor:
-        """Fallback method to compute log probabilities."""
-        with torch.no_grad():
-            outputs = self.model(generated_ids)
-            log_probs = torch.log_softmax(outputs.logits, dim=-1)
+    def _compute_log_probs(
+        self, 
+        # generated_ids is [batch_size, seq_len]
+        generated_ids: torch.Tensor,
+        # scores is a gen_len length tuple, each element is a [batch_size, vocab_size] tensor
+        # scores[i][:,:] are the logits for the ith generated tokens (corresponds to generated_ids[:, i+prompt_lengths])
+        scores: Tuple[torch.Tensor],
+        prompt_lengths: int,
+    ) -> torch.Tensor:
+        """
+        Compute log probabilities for generated sequences.
+        
+        Args:
+            generated_ids: Generated token IDs
+            scores: Generation scores from model
             
-            # Sum log probs for each sequence
-            sequence_log_probs = []
-            for i in range(generated_ids.shape[0]):
-                seq_log_prob = 0.0
-                for j in range(generated_ids.shape[1] - 1):
-                    token_id = generated_ids[i, j + 1]
-                    seq_log_prob += log_probs[i, j, token_id]
-                sequence_log_probs.append(seq_log_prob)
-            
-            return torch.stack(sequence_log_probs)
+        Returns:
+            Log probabilities tensor
+        """     
 
+        scores_tensor = torch.stack(scores, dim=1)
+        return self._compute_log_probs_tensor(generated_ids, scores_tensor, prompt_lengths)
 
 class VERLValueWrapper(nn.Module):
     """
@@ -353,7 +364,7 @@ class VERLTrainer:
             RolloutBatch containing rollout data
         """
         # Generate responses
-        responses, log_probs = self.policy.generate(
+        responses, log_probs, full_seq, prompt_len = self.policy.generate(
             prompts=prompts,
             max_length=self.config.verl.rollout_max_length,
             temperature=self.config.verl.rollout_temperature,
@@ -402,7 +413,9 @@ class VERLTrainer:
             log_probs=log_probs,
             values=values,
             advantages=advantages,
-            returns=returns
+            returns=returns,
+            full_seq=full_seq,
+            prompt_len=prompt_len
         )
     
     def _compute_gae(
@@ -466,19 +479,25 @@ class VERLTrainer:
             return_tensors="pt"
         )
         encoded = {k: v.to(self.device) for k, v in encoded.items()}
+
+        input_ids = rollout_batch.full_seq
+        prompt_len = rollout_batch.prompt_len
         
         # PPO training epochs
         for epoch in range(self.config.verl.ppo_epochs):
             # Forward pass through policy
             policy_outputs = self.policy(
-                input_ids=encoded['input_ids'],
-                attention_mask=encoded['attention_mask']
+                input_ids=rollout_batch.full_seq,
+                attention_mask=(input_ids != self.tokenizer.pad_token_id).long()
             )
+
+            # scores is [batch_size, gen_len, vocab_size]
+            # scores[:,0,x] is the probability score of token x at 0th generated token
+            scores = policy_outputs.logits[:, prompt_len-1:-1,:] 
             
             # Compute new log probabilities
-            log_probs = torch.log_softmax(policy_outputs.logits, dim=-1)
-            new_log_probs = self._extract_action_log_probs(
-                log_probs, encoded['input_ids']
+            new_log_probs = self.policy._compute_log_probs_tensor(
+                input_ids, scores, prompt_len
             )
             
             # BEGIN ASSIGN7_2_2
@@ -555,32 +574,32 @@ class VERLTrainer:
             advantage_std=rollout_batch.advantages.std().item()
         )
     
-    def _extract_action_log_probs(
-        self, 
-        log_probs: torch.Tensor, 
-        input_ids: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Extract log probabilities for the action tokens.
+    # def _extract_action_log_probs(
+    #     self, 
+    #     log_probs: torch.Tensor, 
+    #     input_ids: torch.Tensor
+    # ) -> torch.Tensor:
+    #     """
+    #     Extract log probabilities for the action tokens.
         
-        Args:
-            log_probs: Log probabilities from model output
-            input_ids: Input token IDs
+    #     Args:
+    #         log_probs: Log probabilities from model output
+    #         input_ids: Input token IDs
             
-        Returns:
-            Log probabilities for action tokens
-        """
-        batch_size, seq_len = input_ids.shape
-        action_log_probs = []
+    #     Returns:
+    #         Log probabilities for action tokens
+    #     """
+    #     batch_size, seq_len = input_ids.shape
+    #     action_log_probs = []
         
-        for i in range(batch_size):
-            seq_log_prob = 0.0
-            for j in range(seq_len - 1):
-                token_id = input_ids[i, j + 1]
-                seq_log_prob += log_probs[i, j, token_id]
-            action_log_probs.append(seq_log_prob)
+    #     for i in range(batch_size):
+    #         seq_log_prob = 0.0
+    #         for j in range(seq_len - 1):
+    #             token_id = input_ids[i, j + 1]
+    #             seq_log_prob += log_probs[i, j, token_id]
+    #         action_log_probs.append(seq_log_prob)
         
-        return torch.stack(action_log_probs)
+    #     return torch.stack(action_log_probs)
     
     def _compute_entropy(self, logits: torch.Tensor) -> torch.Tensor:
         """
@@ -731,7 +750,7 @@ def evaluate_policy(
     with torch.no_grad():
         for prompt in eval_prompts:
             # Generate multiple samples per prompt
-            responses, _ = trainer.policy.generate(
+            responses, _, _, _ = trainer.policy.generate(
                 prompts=[prompt] * num_samples,
                 max_length=trainer.config.verl.rollout_max_length,
                 temperature=trainer.config.verl.rollout_temperature,
