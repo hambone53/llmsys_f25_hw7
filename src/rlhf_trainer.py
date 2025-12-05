@@ -128,9 +128,9 @@ class VERLPolicyWrapper(nn.Module):
                 eos_token_id=self.tokenizer.eos_token_id,
                 return_dict_in_generate=True,
                 output_scores=True,
-                # FIX: Add for stability
-                min_p=0.001, # Minimum prob threshold
-                repetition_penalty=1.1, #prvent repeating
+                # # FIX: Add for stability
+                # min_p=0.001, # Minimum prob threshold
+                # repetition_penalty=1.1, #prvent repeating
                 **kwargs
             )
         
@@ -147,7 +147,7 @@ class VERLPolicyWrapper(nn.Module):
         )
         
         # Compute log probabilities for generated tokens
-        log_probs = self._compute_log_probs(generated_ids, generated.scores)
+        log_probs = self._compute_log_probs(generated_ids, generated.scores, prompt_lengths)
         
         self.model.train()
         return responses, log_probs
@@ -155,7 +155,8 @@ class VERLPolicyWrapper(nn.Module):
     def _compute_log_probs(
         self, 
         generated_ids: torch.Tensor, 
-        scores: Tuple[torch.Tensor]
+        scores: Tuple[torch.Tensor],
+        prompt_lengths: int
     ) -> torch.Tensor:
         """
         Compute log probabilities for generated sequences.
@@ -182,10 +183,12 @@ class VERLPolicyWrapper(nn.Module):
         
         for i in range(batch_size):
             sequence_log_probs = []
-            for j in range(1, seq_len):  # Skip first token (from prompt)
-                if j-1 < log_probs.shape[1]:
-                    token_id = generated_ids[i, j]
-                    token_log_prob = log_probs[i, j-1, token_id]
+            for j in range(prompt_lengths, seq_len):  # skip the prompt part
+                token_id = generated_ids[i, j]
+                if token_id == self.tokenizer.pad_token_id: # break if we see padding token
+                    break
+                if j-prompt_lengths < log_probs.shape[1]:
+                    token_log_prob = log_probs[i, j-prompt_lengths, token_id]
                     sequence_log_probs.append(token_log_prob)
             
             if sequence_log_probs:
@@ -230,9 +233,8 @@ class VERLValueWrapper(nn.Module):
         self.tokenizer = tokenizer
         
         # Create value head on top of the policy model
-        from transformers import AutoModelForCausalLM
-        self.backbone = AutoModelForCausalLM.from_pretrained(policy_model.config._name_or_path) # Don't want to share parameters between policy and value model unless we train total loss together.
-        
+        self.backbone = policy_model
+
         self.value_head = nn.Linear(policy_model.config.hidden_size, 1)
         nn.init.normal_(self.value_head.weight, std=0.02)
         nn.init.zeros_(self.value_head.bias)
@@ -271,6 +273,7 @@ class VERLTrainer:
     def __init__(
         self,
         policy_model: PreTrainedModel,
+        value_model: PreTrainedModel,
         reward_model: RewardModel,
         tokenizer: PreTrainedTokenizer,
         config: AssignmentConfig,
@@ -292,7 +295,7 @@ class VERLTrainer:
         
         # Wrap models for VERL compatibility
         self.policy = VERLPolicyWrapper(policy_model, tokenizer)
-        self.value_model = VERLValueWrapper(policy_model, tokenizer)
+        self.value_model = VERLValueWrapper(value_model, tokenizer)
         self.reward_model = reward_model
         
         # Move models to device
@@ -672,17 +675,26 @@ def create_rlhf_trainer(
     # Load tokenizer and model
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     policy_model = AutoModelForCausalLM.from_pretrained(model_name)
+    value_model = AutoModelForCausalLM.from_pretrained(model_name) #Create a 2nd copy of the model to keep the parameters frozen.
     
     # Ensure pad token is set
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-        policy_model.config.pad_token_id = tokenizer.pad_token_id
 
     tokenizer.padding_side = 'left'
+
+    # Set pad token id on both models
+    policy_model.config.pad_token_id = tokenizer.pad_token_id
+    value_model.config.pad_token_id = tokenizer.pad_token_id
+
+    # Put them in evalue mode initially.
+    policy_model.eval()
+    value_model.eval()
     
     # Create trainer
     trainer = VERLTrainer(
         policy_model=policy_model,
+        value_model=value_model,
         reward_model=reward_model,
         tokenizer=tokenizer,
         config=config,
