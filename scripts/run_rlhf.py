@@ -34,7 +34,7 @@ from utils import (
 logger = logging.getLogger(__name__)
 
 
-def run_rlhf_training(config: AssignmentConfig):
+def run_rlhf_training(config: AssignmentConfig, resume_from: str = None):
     """
     Main function to run RLHF training.
     
@@ -134,9 +134,20 @@ def run_rlhf_training(config: AssignmentConfig):
     
     best_reward = float('-inf')
     total_steps = 0
+
+    start_epoch = 0
+    if resume_from and os.path.exists(resume_from):
+        logger.info(f"Resuming training from checkpoint: {resume_from}")
+        checkpoint = trainer.load_checkpoint(resume_from)
+        start_epoch = checkpoint['epoch'] + 1  # Start from next epoch
+        logger.info(f"Resuming from epoch {start_epoch}")
+    
+        # Optionally restore metrics history
+        if 'metrics' in checkpoint:
+            logger.info(f"Previous training metrics: {checkpoint['metrics']}")
     
     # Training loop
-    for epoch in range(config.training.ppo_num_epochs):
+    for epoch in range(start_epoch, config.training.ppo_num_epochs):
         logger.info(f"RLHF Epoch {epoch + 1}/{config.training.ppo_num_epochs}")
         
         epoch_metrics = {
@@ -285,7 +296,7 @@ def run_rlhf_training(config: AssignmentConfig):
     
     # Generate final samples for comparison
     logger.info("Generating final samples for comparison...")
-    final_responses, _, _, _ = trainer.policy.generate(
+    final_responses, _, _, _, _ = trainer.policy.generate(
         prompts=eval_prompts[:5],
         max_length=config.verl.rollout_max_length,
         temperature=config.verl.rollout_temperature,
@@ -411,6 +422,12 @@ def main():
         default=4,
         help="Rollout batch size"
     )
+    parser.add_argument(
+        "--resume_from",
+        type=str,
+        default=None,
+        help="Path to checkpoint file to resume training from"
+    )
     
     args = parser.parse_args()
     
@@ -436,7 +453,7 @@ def main():
     config.validate()
     
     # Run RLHF training
-    run_rlhf_training(config)
+    run_rlhf_training(config, resume_from=args.resume_from)
 
 
 if __name__ == "__main__":
