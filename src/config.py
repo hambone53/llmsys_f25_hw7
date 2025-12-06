@@ -68,7 +68,7 @@ class TrainingConfig:
     # PPO specific parameters
     ppo_clip_range: float = 0.2
     ppo_clip_range_vf: float = 0.2
-    ppo_gamma: float = 0.99
+    ppo_gamma: float = 0.9
     ppo_gae_lambda: float = 0.95
     ppo_value_coef: float = 0.5
     ppo_entropy_coef: float = 0.01

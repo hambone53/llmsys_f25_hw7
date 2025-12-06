@@ -104,16 +104,16 @@ def run_rlhf_training(config: AssignmentConfig):
     metrics_tracker = MetricsTracker()
     
     # Evaluate base model before training
-    # logger.info("Evaluating base model...")
-    # base_eval_metrics = evaluate_policy(
-    #     trainer=trainer,
-    #     eval_prompts=eval_prompts,
-    #     num_samples=3
-    # )
+    logger.info("Evaluating base model...")
+    base_eval_metrics = evaluate_policy(
+        trainer=trainer,
+        eval_prompts=eval_prompts,
+        num_samples=3
+    )
     
-    # logger.info("Base model evaluation results:")
-    # for key, value in base_eval_metrics.items():
-    #     logger.info(f"  {key}: {value:.4f}")
+    logger.info("Base model evaluation results:")
+    for key, value in base_eval_metrics.items():
+        logger.info(f"  {key}: {value:.4f}")
     
     # Generate baseline samples for comparison
     logger.info("Generating baseline samples...")
