@@ -71,11 +71,12 @@ class VERLPolicyWrapper(nn.Module):
         # Ensure pad token is set
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-        
+
         # turn off dropout due to effect described in https://arxiv.org/pdf/2202.11818
         for module in self.model.modules():
             if isinstance(module, nn.Dropout):
                 module.p = 0.0
+        
         
         # Set model to training mode
         self.model.train()
@@ -142,17 +143,15 @@ class VERLPolicyWrapper(nn.Module):
             )
         
         # Extract generated sequences
-        
+
         # generated_ids[:,i + prompt_lengths] is the prediction using generated.scores[:,i]
-        generated_ids = generated.sequences # [batch_size, seq_len]
-        # seq_len is length of the longest sequence generated in the batch (including prompt)
+        generated_ids = generated.sequences
         
-        # prompt_lengths is the padded length of the longest prompt in the batch
-        prompt_lengths = encoded_prompts['input_ids'].shape[1] 
+        prompt_lengths = encoded_prompts['input_ids'].shape[1]
         assert prompt_lengths + len(generated.scores) == generated_ids.shape[1]
-        
+
         response_ids = generated_ids[:, prompt_lengths:]
-        
+
         # Construct masking: our policy tokenizer treats EOS token and PAD token the same
         # hence we need special logic to keep EOS unmasked
         assert self.tokenizer.pad_token_id == self.tokenizer.eos_token_id
@@ -166,44 +165,53 @@ class VERLPolicyWrapper(nn.Module):
         generated_part_mask = (eos_cumsum <= 1).long()
         # concatenate to get the full mask
         full_attention_mask = torch.cat([prompt_mask, generated_part_mask], dim=1)
-        
-        # Switch to train mode for log-prob computation to match training time behavior
-        self.model.train()
-        
+
         with torch.no_grad():
             output = self.model(
                  input_ids = generated_ids,
                  attention_mask = full_attention_mask
              )
-        
+
         scores =  output.logits[:, prompt_lengths - 1 : -1, :]
-        
+
         responses = self.tokenizer.batch_decode(
             response_ids,
-            skip_special_tokens=True, # padding token etc. are stripped
-            clean_up_tokenization_spaces=True # fix spacing
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True
         )
-
+        
         # Compute log probabilities for generated tokens
         log_probs = self._compute_log_probs_tensor(generated_ids, scores, prompt_lengths)
         
         self.model.train()
         return responses, log_probs, prompt_lengths, generated_ids, full_attention_mask
     
-    
     def _compute_log_probs_tensor(
-        self,
-        generated_ids: torch.Tensor, # [batch_size, seq_len]
-        scores: torch.Tensor,  # [batch_size, gen_len, vocab_size]
-        prompt_lengths: int, # seq_len - gen_len
+        self, 
+        generated_ids: torch.Tensor, 
+        scores: torch.Tensor,
+        prompt_lengths: int
     ) -> torch.Tensor:
+        """
+        Compute log probabilities for generated sequences.
         
+        Args:
+            generated_ids: Generated token IDs
+            scores: Generation scores from model
+            
+        Returns:
+            Log probabilities tensor
+        """
         seq_len = generated_ids.shape[1]
         gen_len = scores.shape[1]
         assert seq_len == gen_len + prompt_lengths
         assert self.tokenizer.pad_token_id == self.tokenizer.eos_token_id # this is specific to our setup
         
-        
+        # log_probs = torch.stack([
+        #     torch.log_softmax(score, dim=-1) 
+        #     for score in scores
+        # ], dim=1)
+
         log_probs = torch.log_softmax(scores, dim=-1) # [batch_size, gen_len, vocab_size]
         
         # Extract log probs for generated tokens
@@ -227,8 +235,7 @@ class VERLPolicyWrapper(nn.Module):
             else:
                 generated_log_probs.append(torch.tensor(0.0, device=generated_ids.device))
         
-        return torch.stack(generated_log_probs) # [batch_size,]
-        
+        return torch.stack(generated_log_probs)
     
     def _compute_log_probs(
         self, 
@@ -249,28 +256,9 @@ class VERLPolicyWrapper(nn.Module):
         Returns:
             Log probabilities tensor
         """     
-        
+
         scores_tensor = torch.stack(scores, dim=1)
         return self._compute_log_probs_tensor(generated_ids, scores_tensor, prompt_lengths)
-    
-    def _compute_log_probs_fallback(self, generated_ids: torch.Tensor) -> torch.Tensor:
-        """Fallback method to compute log probabilities."""
-        with torch.no_grad():
-            outputs = self.model(generated_ids)
-            log_probs = torch.log_softmax(outputs.logits, dim=-1)
-            
-            # Sum log probs for each sequence
-            sequence_log_probs = []
-            for i in range(generated_ids.shape[0]):
-                seq_log_prob = 0.0
-                for j in range(generated_ids.shape[1] - 1):
-                    token_id = generated_ids[i, j + 1]
-                    seq_log_prob += log_probs[i, j, token_id]
-                sequence_log_probs.append(seq_log_prob)
-            
-            return torch.stack(sequence_log_probs)
-
-import copy
 
 class VERLValueWrapper(nn.Module):
     """
@@ -289,8 +277,8 @@ class VERLValueWrapper(nn.Module):
         self.tokenizer = tokenizer
         
         # Create value head on top of the policy model
-        self.backbone = copy.deepcopy(policy_model)
-        
+        self.backbone = policy_model
+
         self.value_head = nn.Linear(policy_model.config.hidden_size, 1)
         nn.init.normal_(self.value_head.weight, std=0.02)
         nn.init.zeros_(self.value_head.bias)
@@ -329,6 +317,7 @@ class VERLTrainer:
     def __init__(
         self,
         policy_model: PreTrainedModel,
+        value_model: PreTrainedModel,
         reward_model: RewardModel,
         tokenizer: PreTrainedTokenizer,
         config: AssignmentConfig,
@@ -350,7 +339,7 @@ class VERLTrainer:
         
         # Wrap models for VERL compatibility
         self.policy = VERLPolicyWrapper(policy_model, tokenizer)
-        self.value_model = VERLValueWrapper(policy_model, tokenizer)
+        self.value_model = VERLValueWrapper(value_model, tokenizer)
         self.reward_model = reward_model
         
         # Move models to device
@@ -407,7 +396,7 @@ class VERLTrainer:
         Returns:
             RolloutBatch containing rollout data
         """
-        # Generate responses
+        # Generate responses Rollout (The Experience Gathering) Stage 1
         responses, log_probs, prompt_len, full_seq, full_attention_mask = self.policy.generate(
             prompts=prompts,
             max_length=self.config.verl.rollout_max_length,
@@ -416,7 +405,9 @@ class VERLTrainer:
             do_sample=True
         )
         
+        # Stage 2. Compute / Annotate
         full_texts = [f"{prompt} {response}" for prompt, response in zip(prompts, responses)]
+
         rewards = torch.tensor(
             self.reward_model.get_rewards(full_texts, self.reward_model.tokenizer, self.device),
             device=self.device,
@@ -460,7 +451,7 @@ class VERLTrainer:
             returns=returns,
             full_seq=full_seq,
             prompt_len=prompt_len,
-            full_attn_mask=full_attention_mask,
+            full_attn_mask=full_attention_mask
         )
     
     def _compute_gae(
@@ -510,28 +501,49 @@ class VERLTrainer:
         total_value_loss = 0.0
         total_entropy = 0.0
         total_kl = 0.0
-    
         
+        # # Prepare full texts for training
+        # full_texts = [f"{prompt} {response}" for prompt, response 
+        #              in zip(rollout_batch.prompts, rollout_batch.responses)]
+        
+        # # Tokenize full texts
+        # encoded = self.tokenizer(
+        #     full_texts,
+        #     padding=True,
+        #     truncation=True,
+        #     max_length=self.config.verl.rollout_max_length,
+        #     return_tensors="pt"
+        # )
+        # encoded = {k: v.to(self.device) for k, v in encoded.items()}
+
         input_ids = rollout_batch.full_seq
         prompt_len = rollout_batch.prompt_len
         full_attn_mask = rollout_batch.full_attn_mask
-        
         
         # PPO training epochs
         for epoch in range(self.config.verl.ppo_epochs):
             # Forward pass through policy
             policy_outputs = self.policy(
                 input_ids=input_ids,
-                attention_mask=full_attn_mask,
+                attention_mask=full_attn_mask
             )
+
             # scores is [batch_size, gen_len, vocab_size]
             # scores[:,0,x] is the probability score of token x at 0th generated token
-            scores = policy_outputs.logits[:, prompt_len - 1 : -1, :]
+            scores = policy_outputs.logits[:, prompt_len-1:-1,:] 
             
             # Compute new log probabilities
             new_log_probs = self.policy._compute_log_probs_tensor(
                 input_ids, scores, prompt_len
             )
+
+            # DEBUG
+            if epoch == 0:
+                diff = (new_log_probs - rollout_batch.log_probs).abs()
+                logger.info(f"Max log prob diff: {diff.max().item()}")
+                logger.info(f"Mean log prob diff: {diff.mean().item()}")
+                logger.info(f"Old: {rollout_batch.log_probs[:5]}")
+                logger.info(f"New: {new_log_probs[:5]}")
             
             # BEGIN ASSIGN7_2_2
             # TODO: Compute PPO loss
@@ -547,6 +559,7 @@ class VERLTrainer:
             surr2 = torch.clip(ratio, 1-clip_eps, 1+clip_eps) * rollout_batch.advantages
             policy_loss = -torch.min(surr1, surr2).mean()
             entropy = self._compute_entropy(policy_outputs.logits)
+
             # END ASSIGN7_2_2
             
             # Total policy loss with entropy bonus
@@ -564,11 +577,13 @@ class VERLTrainer:
             value_loss = nn.MSELoss()(values, rollout_batch.returns)
             
             # Compute KL divergence for monitoring
-            # k3 described in http://joschu.net/blog/kl-approx.html
-            log_ratio = new_log_probs - rollout_batch.log_probs
-            approx_kl = (torch.exp(log_ratio) - 1) - log_ratio
+            # http://joschu.net/blog/kl-approx.html
+            # To approximate KL(old || new) using samples from old, we need ratio = new / old
+            logr = new_log_probs - rollout_batch.log_probs
+            approx_kl = (torch.exp(logr) - 1) - logr
             kl_div = approx_kl.mean()
-            
+            #kl_div = (rollout_batch.log_probs - new_log_probs).mean()
+
             # Early stopping if KL divergence is too large
             if kl_div.item() > self.config.verl.ppo_target_kl * 2:
                 logger.warning(f"Early stopping due to large KL divergence: {kl_div.item()}")
@@ -610,6 +625,33 @@ class VERLTrainer:
             advantage_std=rollout_batch.advantages.std().item()
         )
     
+    # def _extract_action_log_probs(
+    #     self, 
+    #     log_probs: torch.Tensor, 
+    #     input_ids: torch.Tensor
+    # ) -> torch.Tensor:
+    #     """
+    #     Extract log probabilities for the action tokens.
+        
+    #     Args:
+    #         log_probs: Log probabilities from model output
+    #         input_ids: Input token IDs
+            
+    #     Returns:
+    #         Log probabilities for action tokens
+    #     """
+    #     batch_size, seq_len = input_ids.shape
+    #     action_log_probs = []
+        
+    #     for i in range(batch_size):
+    #         seq_log_prob = 0.0
+    #         for j in range(seq_len - 1):
+    #             token_id = input_ids[i, j + 1]
+    #             seq_log_prob += log_probs[i, j, token_id]
+    #         action_log_probs.append(seq_log_prob)
+        
+    #     return torch.stack(action_log_probs)
+    
     def _compute_entropy(self, logits: torch.Tensor) -> torch.Tensor:
         """
         Compute entropy of the policy distribution.
@@ -630,6 +672,7 @@ class VERLTrainer:
         log_probs = torch.log_softmax(logits, dim=-1)
         entropy = -(probs * log_probs).sum(dim=-1).mean()
         return entropy
+        
         # END ASSIGN7_2_3
     
     def save_checkpoint(self, checkpoint_path: str, epoch: int, metrics: Dict[str, float]):
@@ -701,17 +744,41 @@ def create_rlhf_trainer(
     """
     # Load tokenizer and model
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    tokenizer.padding_side = "left"
     policy_model = AutoModelForCausalLM.from_pretrained(model_name)
+    value_model = AutoModelForCausalLM.from_pretrained(model_name) #Create a 2nd copy of the model to keep the parameters frozen.
     
+    # policy_model.config.attn_pdrop = 0.0
+    # policy_model.config.embd_pdrop = 0.0
+    # policy_model.config.resid_pdrop = 0.0
+
+    # # Disable dropout in policy model
+    # for module in policy_model.modules():
+    #     if isinstance(module, torch.nn.Dropout):
+    #         module.p = 0.0
+
+    # # Disable dropout in value model
+    # for module in value_model.modules():
+    #     if isinstance(module, torch.nn.Dropout):
+    #         module.p = 0.0
+
     # Ensure pad token is set
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-        policy_model.config.pad_token_id = tokenizer.pad_token_id
+
+    tokenizer.padding_side = 'left'
+
+    # Set pad token id on both models
+    policy_model.config.pad_token_id = tokenizer.pad_token_id
+    value_model.config.pad_token_id = tokenizer.pad_token_id
+
+    # Put them in evalue mode initially.
+    policy_model.eval()
+    value_model.eval()
     
     # Create trainer
     trainer = VERLTrainer(
         policy_model=policy_model,
+        value_model=value_model,
         reward_model=reward_model,
         tokenizer=tokenizer,
         config=config,
@@ -746,10 +813,10 @@ def evaluate_policy(
     all_response_lengths = []
     
     with torch.no_grad():
-        pbar = tqdm(eval_prompts, desc="Evaluating Policy", unit="prompt")
+        pbar = tqdm(eval_prompts, desc="Evaluation polity", unit="prompt")
         for prompt in pbar:
             # Generate multiple samples per prompt
-            responses,_, _, _, _ = trainer.policy.generate(
+            responses, _, _, _, _ = trainer.policy.generate(
                 prompts=[prompt] * num_samples,
                 max_length=trainer.config.verl.rollout_max_length,
                 temperature=trainer.config.verl.rollout_temperature,
@@ -767,7 +834,7 @@ def evaluate_policy(
             
             all_rewards.extend(rewards)
             all_response_lengths.extend([len(response.split()) for response in responses])
-            
+
             current_mean_reward = sum(all_rewards) / len(all_rewards)
             pbar.set_postfix({
                 "avg_reward": f"{current_mean_reward:.3f}", 
