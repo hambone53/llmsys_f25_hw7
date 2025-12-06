@@ -68,7 +68,7 @@ class TrainingConfig:
     # PPO specific parameters
     ppo_clip_range: float = 0.2
     ppo_clip_range_vf: float = 0.2
-    ppo_gamma: float = 0.9
+    ppo_gamma: float = 0.99
     ppo_gae_lambda: float = 0.95
     ppo_value_coef: float = 0.5
     ppo_entropy_coef: float = 0.01
@@ -100,7 +100,7 @@ class VERLConfig:
     # PPO algorithm settings
     ppo_epochs: int = 4
     ppo_clip_eps: float = 0.2
-    ppo_target_kl: float = 1
+    ppo_target_kl: float = 0.01
     ppo_adaptive_kl: bool = True
     ppo_kl_penalty: float = 0.1
     
@@ -109,7 +109,7 @@ class VERLConfig:
     value_loss_coef: float = 0.5
     
     # Reward settings
-    reward_clip: float = 5.0
+    reward_clip: float = 1
     reward_normalize: bool = True
 
 
